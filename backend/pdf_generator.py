@@ -138,7 +138,7 @@ def create_pdf_from_structured_cv(cv_data: StructuredCV) -> io.BytesIO:
             pdf.multi_cell(0, 5, deg_text, new_x="LMARGIN", new_y="NEXT")
 
     # --- Languages & Other Skills ---
-    if cv_data.languages_other:
+    if cv_data.languages_other.languages or cv_data.languages_other.other_skills:
         add_section_heading("Languages & Other Skills")
         if cv_data.languages_other.languages:
             pdf.set_font(FONT, style="B", size=11)

@@ -3,7 +3,7 @@ Pydantic schemas for data validation and defining the structured output
 expected from the Gemini LLM.
 """
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List
 
 class SectionFeedback(BaseModel):
     """Feedback specific to sections of the CV."""

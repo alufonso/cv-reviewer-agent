@@ -207,21 +207,25 @@ def create_docx_from_structured_cv(cv_data: StructuredCV) -> io.BytesIO:
             set_font(deg_run, size=11)
 
     # --- Languages & Other Skills ---
-    if cv_data.languages_other:
+    # Only print the section, and each line, when there is something to show.
+    lang_other = cv_data.languages_other
+    if lang_other.languages or lang_other.other_skills:
         add_section_heading("Languages & Other Skills")
 
-        lang_p = document.add_paragraph()
-        lang_p.paragraph_format.space_after = Pt(0)
-        lang_title = lang_p.add_run("Languages: ")
-        set_font(lang_title, size=11, bold=True)
-        lang_text = lang_p.add_run(cv_data.languages_other.languages)
-        set_font(lang_text, size=11)
+        if lang_other.languages:
+            lang_p = document.add_paragraph()
+            lang_p.paragraph_format.space_after = Pt(0)
+            lang_title = lang_p.add_run("Languages: ")
+            set_font(lang_title, size=11, bold=True)
+            lang_text = lang_p.add_run(lang_other.languages)
+            set_font(lang_text, size=11)
 
-        other_p = document.add_paragraph()
-        other_title = other_p.add_run("Other Skills: ")
-        set_font(other_title, size=11, bold=True)
-        other_text = other_p.add_run(cv_data.languages_other.other_skills)
-        set_font(other_text, size=11)
+        if lang_other.other_skills:
+            other_p = document.add_paragraph()
+            other_title = other_p.add_run("Other Skills: ")
+            set_font(other_title, size=11, bold=True)
+            other_text = other_p.add_run(lang_other.other_skills)
+            set_font(other_text, size=11)
 
     # Save to BytesIO stream
     doc_stream = io.BytesIO()
