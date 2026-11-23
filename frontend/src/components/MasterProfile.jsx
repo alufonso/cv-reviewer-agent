@@ -26,6 +26,9 @@ const MasterProfile = () => {
   const [isSaving, setIsSaving] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [message, setMessage] = useState({ text: '', type: '' });
+  // Set when the saved profile could not be loaded. Saving is blocked while set,
+  // so the empty placeholder profile can never overwrite the real file.
+  const [loadError, setLoadError] = useState('');
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -54,13 +57,24 @@ const MasterProfile = () => {
       });
     } catch (error) {
       console.error(error);
-      setMessage({ text: 'Failed to load profile.', type: 'error' });
+      setLoadError(error.message);
+      setMessage({ text: error.message || 'Failed to load profile.', type: 'error' });
     } finally {
       setIsLoading(false);
     }
   };
 
+  /**
+   * Saves the profile to the backend. Refuses to save if the existing profile
+   * failed to load, to avoid replacing real data with an empty profile.
+   *
+   * @param {Object} updatedProfile - The full profile to save.
+   */
   const handleSaveProfile = async (updatedProfile) => {
+    if (loadError) {
+      setMessage({ text: `Not saved: the existing profile could not be loaded (${loadError}). Fix the file and reload.`, type: 'error' });
+      return;
+    }
     setIsSaving(true);
     setMessage({ text: '', type: '' });
 

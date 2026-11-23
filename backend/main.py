@@ -4,6 +4,7 @@ Defines the API routes for CV analysis.
 """
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -30,7 +31,7 @@ app = FastAPI(
 MASTER_PROFILE_PATH = "master_profile.json"
 
 # --- Apply Suggestion: Cache & Rate Limiting ---
-# In-memory cache keyed by hash(suggestion + master_profile_version + job_description).
+# In-memory cache keyed by hash(suggestion + profile + job description + baseline CV + language).
 # Prevents duplicate API calls when user clicks the same suggestion twice.
 suggestion_cache: dict[str, dict] = {}
 
@@ -40,10 +41,13 @@ APPLY_RATE_LIMIT = 5       # max calls per window
 APPLY_RATE_WINDOW = 60     # window in seconds
 rate_limit_tracker: dict[str, list[float]] = {}
 
-# Set up CORS for local development
+# Only the local frontend may call this API from a browser. A wildcard would let
+# any website the user visits read and overwrite the Master Profile.
+# Override with a comma-separated list in ALLOWED_ORIGINS if the frontend runs elsewhere.
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allowing all origins for now
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,29 +63,82 @@ def read_root():
     """
     return {"message": "Welcome to CVSight API. Go to /docs for Swagger UI."}
 
+def _read_profile_dict() -> Optional[dict]:
+    """
+    Reads the saved Master Profile JSON.
+
+    Returns:
+        dict | None: The profile data, or None when no profile has been saved yet.
+
+    Raises:
+        HTTPException: 500 if the file exists but cannot be read. Treating a broken
+            file as "no profile" would let the UI save an empty profile over it.
+    """
+    if not os.path.exists(MASTER_PROFILE_PATH):
+        return None
+    try:
+        with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{MASTER_PROFILE_PATH} exists but could not be read ({e}). Fix or remove the file.",
+        )
+
+
+def _require_profile() -> dict:
+    """
+    Returns the saved Master Profile data.
+
+    Raises:
+        HTTPException: 400 if no (or an empty) profile is saved, 500 if it is unreadable.
+    """
+    data = _read_profile_dict()
+    if not data:
+        raise HTTPException(status_code=400, detail="Master Profile not found. Please create one first.")
+    return data
+
+
+def _file_response(stream, media_type: str, filename: str) -> StreamingResponse:
+    """Wraps a generated file stream as a browser download."""
+    return StreamingResponse(
+        stream,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
+
+DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
 @app.get("/profile", response_model=MasterProfile)
 def get_master_profile():
     """
     Retrieves the local Master Profile.
     If it doesn't exist, returns an empty profile.
+
+    Raises:
+        HTTPException: 500 if the file exists but cannot be read.
     """
-    if os.path.exists(MASTER_PROFILE_PATH):
-        try:
-            with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return MasterProfile(**data)
-        except Exception:
-            pass
-    return MasterProfile()
+    data = _read_profile_dict()
+    return MasterProfile(**data) if data is not None else MasterProfile()
 
 @app.post("/profile")
 def update_master_profile(profile: MasterProfile):
     """
     Updates the local Master Profile and saves it to a JSON file.
+
+    Writes to a temporary file first and then swaps it in, so a crash mid-write
+    never leaves a half-written profile behind.
     """
+    tmp_path = MASTER_PROFILE_PATH + ".tmp"
     try:
-        with open(MASTER_PROFILE_PATH, "w", encoding="utf-8") as f:
-            json.dump(profile.model_dump(), f, indent=4)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(profile.model_dump(), f, indent=4, ensure_ascii=False)
+        os.replace(tmp_path, MASTER_PROFILE_PATH)
         return {"status": "success", "message": "Master Profile updated successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save profile: {str(e)}")
@@ -94,224 +151,113 @@ async def analyze_endpoint(
     """
     Endpoint to upload a CV (PDF) and an optional job description for analysis.
     If no CV is uploaded, it analyzes the saved Master Profile instead.
-    
+
+    The Gemini call runs in a worker thread so the server keeps answering
+    other requests while it waits.
+
     Args:
         cv_file (UploadFile, optional): The uploaded PDF file containing the CV.
         job_description (str, optional): The job description to compare against. Defaults to "".
-        
+
     Returns:
         AnalysisResponse: The structured analysis result from the AI.
-        
+
     Raises:
         HTTPException: If the file is not a PDF, or if parsing/analysis fails.
     """
     cv_text = ""
     if cv_file:
-        if cv_file.content_type not in ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"] and not cv_file.filename.endswith((".pdf", ".docx")):
+        if cv_file.content_type not in ["application/pdf", DOCX_MEDIA_TYPE] and not cv_file.filename.endswith((".pdf", ".docx")):
             raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported.")
-        
+
         try:
-            # Read the uploaded file bytes
             file_bytes = await cv_file.read()
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
-            
-        # Extract text from the PDF or DOCX
+
         try:
             if cv_file.filename.endswith(".pdf") or cv_file.content_type == "application/pdf":
                 cv_text = extract_text_from_pdf(file_bytes)
             else:
                 cv_text = extract_text_from_docx(file_bytes)
-                
+
             if not cv_text.strip():
                 raise ValueError("No text could be extracted from the file.")
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"File parsing error: {str(e)}")
-        
-    # Read Master Profile if it exists
-    master_profile_data = None
-    if os.path.exists(MASTER_PROFILE_PATH):
-        try:
-            with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
-                master_profile_data = json.load(f)
-        except Exception as e:
-            print(f"Warning: Failed to read master profile: {e}")
+
+    master_profile_data = _read_profile_dict()
 
     if not cv_text and not master_profile_data:
         raise HTTPException(status_code=400, detail="Must provide either a CV file or have a saved Master Profile.")
 
-    # Analyze the CV
     try:
-        analysis_result = analyze_cv(cv_text, job_description, master_profile_data)
-        return analysis_result
+        return await run_in_threadpool(analyze_cv, cv_text, job_description, master_profile_data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 @app.post("/profile/extract", response_model=MasterProfile)
 async def extract_profile_endpoint(cv_file: UploadFile = File(...)):
     """
-    Endpoint to upload a CV (PDF) and extract its data into a Master Profile schema.
+    Endpoint to upload a CV (PDF, DOCX or JSON) and extract its data into a Master Profile schema.
+    The Gemini call runs in a worker thread so the server stays responsive.
     """
-    if cv_file.content_type not in ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/json", "text/json"] and not cv_file.filename.endswith((".pdf", ".docx", ".json")):
+    if cv_file.content_type not in ["application/pdf", DOCX_MEDIA_TYPE, "application/json", "text/json"] and not cv_file.filename.endswith((".pdf", ".docx", ".json")):
         raise HTTPException(status_code=400, detail="Only PDF, DOCX, and JSON files are supported.")
-    
+
     try:
         file_bytes = await cv_file.read()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
-        
+
     try:
         if cv_file.filename.endswith(".pdf") or cv_file.content_type == "application/pdf":
             cv_text = extract_text_from_pdf(file_bytes)
-        elif cv_file.filename.endswith(".docx") or cv_file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        elif cv_file.filename.endswith(".docx") or cv_file.content_type == DOCX_MEDIA_TYPE:
             cv_text = extract_text_from_docx(file_bytes)
         else:
             # Assume JSON or text
             cv_text = file_bytes.decode('utf-8')
-            
+
         if not cv_text.strip():
             raise ValueError("No text could be extracted from the file.")
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"File parsing error: {str(e)}")
-        
+
     try:
-        profile_result = extract_profile_from_cv(cv_text)
-        return profile_result
+        return await run_in_threadpool(extract_profile_from_cv, cv_text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Profile extraction failed: {str(e)}")
 
-@app.post("/generate/docx")
-async def generate_cv_docx_endpoint(job_description: str = Form(default=""), language: str = Form(default="English")):
-    """
-    Endpoint to generate an ATS-friendly CV (.docx) based on the Master Profile and a Job Description.
-    """
-    master_profile_data = None
-    if os.path.exists(MASTER_PROFILE_PATH):
-        try:
-            with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
-                master_profile_data = json.load(f)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read master profile: {str(e)}")
-            
-    if not master_profile_data:
-        raise HTTPException(status_code=400, detail="Master Profile not found. Please create one first.")
-        
-    try:
-        # Generate structured JSON from Gemini
-        structured_cv = generate_cv_from_profile(job_description, master_profile_data, language=language)
-        
-        # Convert JSON to DOCX bytes stream
-        doc_stream = create_docx_from_structured_cv(structured_cv)
-        
-        # Return as downloadable file
-        return StreamingResponse(
-            doc_stream, 
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={
-                "Content-Disposition": "attachment; filename=Tailored_CV.docx",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CV generation failed: {str(e)}")
-
 @app.post("/generate/preview", response_model=StructuredCV)
-async def generate_cv_preview_endpoint(job_description: str = Form(default=""), language: str = Form(default="English")):
+def generate_cv_preview_endpoint(job_description: str = Form(default=""), language: str = Form(default="English")):
     """
     Endpoint to generate an ATS-friendly CV preview (JSON) based on the Master Profile and a Job Description.
+    A plain `def` endpoint: FastAPI runs it in a worker thread, so the Gemini wait does not block the server.
     """
-    master_profile_data = None
-    if os.path.exists(MASTER_PROFILE_PATH):
-        try:
-            with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
-                master_profile_data = json.load(f)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read master profile: {str(e)}")
-            
-    if not master_profile_data:
-        raise HTTPException(status_code=400, detail="Master Profile not found. Please create one first.")
-        
+    master_profile_data = _require_profile()
     try:
-        # Generate structured JSON from Gemini
-        structured_cv = generate_cv_from_profile(job_description, master_profile_data, language=language)
-        return structured_cv
+        return generate_cv_from_profile(job_description, master_profile_data, language=language)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CV preview generation failed: {str(e)}")
 
 @app.post("/generate/docx/from-json")
-async def generate_cv_docx_from_json_endpoint(structured_cv: StructuredCV):
+def generate_cv_docx_from_json_endpoint(structured_cv: StructuredCV):
     """
     Endpoint to generate an ATS-friendly CV (.docx) directly from a provided StructuredCV JSON object.
     """
     try:
-        # Convert JSON to DOCX bytes stream
-        doc_stream = create_docx_from_structured_cv(structured_cv)
-        
-        # Return as downloadable file
-        return StreamingResponse(
-            doc_stream, 
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={
-                "Content-Disposition": "attachment; filename=Tailored_CV.docx",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
+        return _file_response(create_docx_from_structured_cv(structured_cv), DOCX_MEDIA_TYPE, "Tailored_CV.docx")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CV DOCX generation failed: {str(e)}")
 
-@app.post("/generate/pdf")
-async def generate_cv_pdf_endpoint(job_description: str = Form(default=""), language: str = Form(default="English")):
-    """
-    Endpoint to generate an ATS-friendly CV (.pdf) based on the Master Profile and a Job Description.
-    """
-    master_profile_data = None
-    if os.path.exists(MASTER_PROFILE_PATH):
-        try:
-            with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
-                master_profile_data = json.load(f)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read master profile: {str(e)}")
-            
-    if not master_profile_data:
-        raise HTTPException(status_code=400, detail="Master Profile not found. Please create one first.")
-        
-    try:
-        # Generate structured JSON from Gemini
-        structured_cv = generate_cv_from_profile(job_description, master_profile_data, language=language)
-        
-        # Convert JSON to PDF bytes stream
-        pdf_stream = create_pdf_from_structured_cv(structured_cv)
-        
-        # Return as downloadable file
-        return StreamingResponse(
-            pdf_stream, 
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": "attachment; filename=Tailored_CV.pdf",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CV PDF generation failed: {str(e)}")
-
 @app.post("/generate/pdf/from-json")
-async def generate_cv_pdf_from_json_endpoint(structured_cv: StructuredCV):
+def generate_cv_pdf_from_json_endpoint(structured_cv: StructuredCV):
     """
     Endpoint to generate an ATS-friendly CV (.pdf) directly from a provided StructuredCV JSON object.
     """
     try:
-        # Convert JSON to PDF bytes stream
-        pdf_stream = create_pdf_from_structured_cv(structured_cv)
-        
-        # Return as downloadable file
-        return StreamingResponse(
-            pdf_stream, 
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": "attachment; filename=Tailored_CV.pdf",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
+        return _file_response(create_pdf_from_structured_cv(structured_cv), "application/pdf", "Tailored_CV.pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CV PDF generation failed: {str(e)}")
 
@@ -334,16 +280,18 @@ def _check_rate_limit(client_ip: str) -> None:
     rate_limit_tracker[client_ip] = timestamps
 
 
-def _make_cache_key(suggestion: str, profile_json: str, job_description: str) -> str:
+def _make_cache_key(*parts: str) -> str:
     """
-    Creates a deterministic cache key from suggestion + profile + JD.
+    Creates a deterministic cache key from every input that changes the result
+    (suggestion, profile, job description, baseline CV, language).
+    Parts are joined with a separator that cannot appear in normal text.
     """
-    raw = f"{suggestion}|{profile_json}|{job_description}"
+    raw = "\x1f".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 @app.post("/apply-suggestion", response_model=StructuredCV)
-async def apply_suggestion_endpoint(
+def apply_suggestion_endpoint(
     request: Request,
     suggestion: str = Form(...),
     job_description: str = Form(default=""),
@@ -356,8 +304,9 @@ async def apply_suggestion_endpoint(
     The Master Profile is NOT modified. Instead, a new CV is generated that
     incorporates the specified suggestion fix.
 
-    Includes in-memory caching (same suggestion + profile + JD = cached result)
-    and per-IP rate limiting to prevent API abuse.
+    Includes in-memory caching (same inputs = cached result) and per-IP rate
+    limiting to prevent API abuse. A plain `def` endpoint, so the Gemini wait
+    runs in a worker thread.
 
     Args:
         request: The FastAPI Request object (for client IP).
@@ -369,30 +318,17 @@ async def apply_suggestion_endpoint(
     Returns:
         StructuredCV: The improved CV with the suggestion applied.
     """
-    # Rate limit check
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
 
-    # Read Master Profile
-    master_profile_data = None
-    if os.path.exists(MASTER_PROFILE_PATH):
-        try:
-            with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
-                master_profile_data = json.load(f)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read master profile: {str(e)}")
+    master_profile_data = _require_profile()
 
-    if not master_profile_data:
-        raise HTTPException(status_code=400, detail="Master Profile not found. Please create one first.")
-
-    # Cache check
     profile_json_str = json.dumps(master_profile_data, sort_keys=True)
-    cache_key = _make_cache_key(suggestion, profile_json_str, job_description)
+    cache_key = _make_cache_key(suggestion, profile_json_str, job_description, original_cv, language)
     if cache_key in suggestion_cache:
         print(f"Cache hit for suggestion: {suggestion[:50]}...")
         return StructuredCV(**suggestion_cache[cache_key])
 
-    # Parse original_cv if provided
     original_cv_data = None
     if original_cv.strip():
         try:
@@ -408,7 +344,6 @@ async def apply_suggestion_endpoint(
             original_cv=original_cv_data,
             language=language
         )
-        # Store in cache
         suggestion_cache[cache_key] = result.model_dump()
         return result
     except Exception as e:

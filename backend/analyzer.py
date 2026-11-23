@@ -2,24 +2,66 @@
 Module responsible for communicating with the Gemini AI model.
 Handles prompt construction and parsing the structured response.
 """
-import os
 import json
+from typing import Type, TypeVar
 from google import genai
 from google.genai import types
 from schemas import AnalysisResponse, MasterProfile, StructuredCV
-from pydantic import ValidationError
+from pydantic import BaseModel
+
+# Models tried in order. When one is overloaded (503) or out of quota (429),
+# the next one is used. Any other error stops right away.
+MODELS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+RETRYABLE_MARKERS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")
+
+T = TypeVar("T", bound=BaseModel)
+
+
+def _generate(prompt: str, schema: Type[T], temperature: float, task: str) -> T:
+    """
+    Sends a prompt to Gemini and parses the JSON answer into the given Pydantic schema.
+
+    Tries each model in MODELS until one answers. The client reads GEMINI_API_KEY
+    from the environment.
+
+    Args:
+        prompt: The full prompt text.
+        schema: Pydantic model the response must match.
+        temperature: Sampling temperature (low = more consistent).
+        task: Short label used in logs and error messages.
+
+    Raises:
+        RuntimeError: On a non-retryable error, or when every model is busy.
+    """
+    client = genai.Client()
+    last_error = None
+    for model_name in MODELS:
+        try:
+            print(f"Trying model ({task}): {model_name}...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                    temperature=temperature,
+                ),
+            )
+            return schema.model_validate_json(response.text)
+        except Exception as e:
+            last_error = str(e)
+            if any(marker in last_error for marker in RETRYABLE_MARKERS):
+                print(f"Model {model_name} is busy or out of quota. Trying the next one...")
+                continue
+            raise RuntimeError(f"Failed to {task} with Gemini API ({model_name}): {last_error}")
+    raise RuntimeError(f"All models failed due to high demand. Last error: {last_error}")
+
 
 def analyze_cv(cv_text: str, job_description: str = "", master_profile: dict = None) -> AnalysisResponse:
     """
     Analyzes the CV text against the job description using Gemini API.
     Returns a structured AnalysisResponse.
     """
-    # Initialize the Gemini client. It automatically picks up GEMINI_API_KEY from env.
-    client = genai.Client()
-    
-    # We define a list of models to try in case of 503 UNAVAILABLE errors due to high demand
-    models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
-    
     
     master_profile_str = ""
     if master_profile:
@@ -63,43 +105,13 @@ Provide a detailed analysis including:
 Ensure your response is highly specific to the provided CV content.
 """
 
-    last_error = None
-    for model_name in models_to_try:
-        try:
-            print(f"Trying model: {model_name}...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=AnalysisResponse,
-                    temperature=0.2, # Lower temperature for more consistent, analytical output
-                ),
-            )
-            
-            # The response.text is guaranteed to match the schema, but we parse it into the Pydantic model
-            # to ensure it's fully validated and ready for the FastAPI response.
-            return AnalysisResponse.model_validate_json(response.text)
-            
-        except Exception as e:
-            error_str = str(e)
-            last_error = error_str
-            if "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                print(f"Model {model_name} is unavailable or exhausted quota. Falling back to next model...")
-                continue
-            else:
-                # If it's a different error, raise it immediately
-                raise RuntimeError(f"Failed to analyze CV with Gemini API ({model_name}): {error_str}")
-
-    raise RuntimeError(f"All models failed due to high demand. Last error: {last_error}")
+    return _generate(prompt, AnalysisResponse, temperature=0.2, task="analyze CV")
 
 def extract_profile_from_cv(cv_text: str) -> MasterProfile:
     """
     Extracts structured profile information from CV text using Gemini API.
     Returns a MasterProfile object.
     """
-    client = genai.Client()
-    models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
     
     prompt = f"""
 You are an expert data extractor. Your task is to extract structured information from the following CV text and map it to a Master Profile schema.
@@ -117,38 +129,12 @@ CV Text:
 {cv_text}
 """
 
-    last_error = None
-    for model_name in models_to_try:
-        try:
-            print(f"Trying model (extraction): {model_name}...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=MasterProfile,
-                    temperature=0.1,
-                ),
-            )
-            return MasterProfile.model_validate_json(response.text)
-            
-        except Exception as e:
-            error_str = str(e)
-            last_error = error_str
-            if "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                print(f"Model {model_name} is unavailable or exhausted quota. Falling back to next model...")
-                continue
-            else:
-                raise RuntimeError(f"Failed to extract profile with Gemini API ({model_name}): {error_str}")
-
-    raise RuntimeError(f"All models failed due to high demand. Last error: {last_error}")
+    return _generate(prompt, MasterProfile, temperature=0.1, task="extract profile")
 
 def generate_cv_from_profile(job_description: str, master_profile: dict, language: str = "English") -> StructuredCV:
     """
     Generates an ATS-friendly CV structure based on the master profile and a job description.
     """
-    client = genai.Client()
-    models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
     
     prompt = f"""
 You are an expert technical resume writer. Your task is to extract and tailor information from the provided Master Profile to perfectly match the Job Description below.
@@ -183,31 +169,7 @@ Master Profile:
 {json.dumps(master_profile, indent=2)}
 """
 
-    last_error = None
-    for model_name in models_to_try:
-        try:
-            print(f"Trying model (generation): {model_name}...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=StructuredCV,
-                    temperature=0.15, # Kept low — this step must stay grounded in Master Profile facts, not "creative"
-                ),
-            )
-            return StructuredCV.model_validate_json(response.text)
-            
-        except Exception as e:
-            error_str = str(e)
-            last_error = error_str
-            if "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                print(f"Model {model_name} is unavailable or exhausted quota. Falling back to next model...")
-                continue
-            else:
-                raise RuntimeError(f"Failed to generate CV with Gemini API ({model_name}): {error_str}")
-
-    raise RuntimeError(f"All models failed due to high demand. Last error: {last_error}")
+    return _generate(prompt, StructuredCV, temperature=0.15, task="generate CV")
 
 def apply_suggestion_to_cv(
     suggestion: str,
@@ -234,8 +196,6 @@ def apply_suggestion_to_cv(
     Returns:
         StructuredCV: A new CV with the suggestion incorporated.
     """
-    client = genai.Client()
-    models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
 
     original_cv_section = ""
     if original_cv:
@@ -278,28 +238,4 @@ Master Profile:
 OUTPUT LANGUAGE: The ENTIRE CV output MUST be written in {language}.
 """
 
-    last_error = None
-    for model_name in models_to_try:
-        try:
-            print(f"Trying model (apply-suggestion): {model_name}...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=StructuredCV,
-                    temperature=0.15,
-                ),
-            )
-            return StructuredCV.model_validate_json(response.text)
-
-        except Exception as e:
-            error_str = str(e)
-            last_error = error_str
-            if "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                print(f"Model {model_name} is unavailable or exhausted quota. Falling back to next model...")
-                continue
-            else:
-                raise RuntimeError(f"Failed to apply suggestion with Gemini API ({model_name}): {error_str}")
-
-    raise RuntimeError(f"All models failed due to high demand. Last error: {last_error}")
+    return _generate(prompt, StructuredCV, temperature=0.15, task="apply suggestion")

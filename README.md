@@ -191,7 +191,7 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 1. **Upload/Extract**: User uploads a CV (PDF/DOCX). The React frontend sends it to `/profile/extract`. The FastAPI backend uses `parser.py` to extract text and `analyzer.py` to structure it via Gemini into a Master Profile.
 2. **Analyze**: User inputs a Job Description. Frontend calls `/analyze`. Backend uses Gemini to compare the Master Profile to the Job Description and returns fit percentage, missing keywords, and suggestions.
-3. **Generate Tailored CV**: User clicks generate. Frontend calls `/generate/docx` or `/generate/pdf`. Backend merges the Master Profile and Job Description via Gemini to create a tailored JSON structure, then converts it to DOCX or PDF using `docx_generator.py` or `pdf_generator.py`.
+3. **Generate Tailored CV**: User clicks generate. Frontend calls `/generate/preview`, where Gemini merges the Master Profile and Job Description into a tailored JSON structure shown as a preview. Downloading sends that JSON to `/generate/docx/from-json` or `/generate/pdf/from-json`, which convert it with `docx_generator.py` or `pdf_generator.py`.
 4. **Interactive Fixes**: User clicks a suggestion. Frontend calls `/apply-suggestion`. Backend generates an updated CV preview containing the fix, caching it by a deterministic hash to prevent duplicate AI calls.
 
 ## Troubleshooting
