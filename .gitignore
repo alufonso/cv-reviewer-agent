@@ -19,6 +19,7 @@ Desktop.ini
 
 # --- Backend (Python) ---
 backend/__pycache__/
+__pycache__/
 backend/*.py[cod]
 backend/*$py.class
 backend/.venv/
@@ -51,6 +52,7 @@ backend/.ruff_cache/
 backend/.pytype/
 backend/.cython_workspace/
 backend/master_profile.json
+backend/master_profile.json.tmp
 
 # --- Frontend (Node.js / Next.js / React) ---
 frontend/node_modules/

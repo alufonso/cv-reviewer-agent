@@ -40,10 +40,13 @@ APPLY_RATE_LIMIT = 5       # max calls per window
 APPLY_RATE_WINDOW = 60     # window in seconds
 rate_limit_tracker: dict[str, list[float]] = {}
 
-# Set up CORS for local development
+# Only the local frontend may call this API from a browser. A wildcard would let
+# any website the user visits read and overwrite the Master Profile.
+# Override with a comma-separated list in ALLOWED_ORIGINS if the frontend runs elsewhere.
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allowing all origins for now
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,24 +67,35 @@ def get_master_profile():
     """
     Retrieves the local Master Profile.
     If it doesn't exist, returns an empty profile.
+
+    Raises:
+        HTTPException: 500 if the file exists but cannot be read. Returning an empty
+            profile here would let the UI save it over the user's real data.
     """
-    if os.path.exists(MASTER_PROFILE_PATH):
-        try:
-            with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return MasterProfile(**data)
-        except Exception:
-            pass
-    return MasterProfile()
+    if not os.path.exists(MASTER_PROFILE_PATH):
+        return MasterProfile()
+    try:
+        with open(MASTER_PROFILE_PATH, "r", encoding="utf-8") as f:
+            return MasterProfile(**json.load(f))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{MASTER_PROFILE_PATH} exists but could not be read ({e}). Fix or remove the file.",
+        )
 
 @app.post("/profile")
 def update_master_profile(profile: MasterProfile):
     """
     Updates the local Master Profile and saves it to a JSON file.
+
+    Writes to a temporary file first and then swaps it in, so a crash mid-write
+    never leaves a half-written profile behind.
     """
+    tmp_path = MASTER_PROFILE_PATH + ".tmp"
     try:
-        with open(MASTER_PROFILE_PATH, "w", encoding="utf-8") as f:
-            json.dump(profile.model_dump(), f, indent=4)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(profile.model_dump(), f, indent=4, ensure_ascii=False)
+        os.replace(tmp_path, MASTER_PROFILE_PATH)
         return {"status": "success", "message": "Master Profile updated successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save profile: {str(e)}")
